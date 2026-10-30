@@ -564,6 +564,12 @@ int filtered_sysnum_flags(const Tracee *tracee, Sysnum sysnum)
 	return flags;
 }
 
+/* Minis (FIX-261030-14): a host build can never claim the filter exists. */
+bool seccomp_filter_built_in(void)
+{
+	return true;
+}
+
 #else
 
 #include "syscall/seccomp.h"
@@ -578,6 +584,13 @@ int enable_syscall_filtering(const Tracee *tracee UNUSED)
 int filtered_sysnum_flags(const Tracee *tracee UNUSED, Sysnum sysnum UNUSED)
 {
 	return 0;
+}
+
+/* Minis (FIX-261030-14): enable_syscall_filtering() "succeeds" here without
+ * installing anything, so the diagnostics must not call that "enabled".  */
+bool seccomp_filter_built_in(void)
+{
+	return false;
 }
 
 #endif /* defined(HAVE_SECCOMP_FILTER) */
