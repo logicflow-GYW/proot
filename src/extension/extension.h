@@ -234,6 +234,7 @@ extern int fix_symlink_size_callback(Extension *extension, ExtensionEvent event,
 #if defined(__ANDROID__) || defined(__BIONIC__)
 extern int ashmem_memfd_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 #endif /* defined(__ANDROID__) || defined(__BIONIC__) */
+extern int readonly_paths_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 extern int mountinfo_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 extern int native_offload_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 
