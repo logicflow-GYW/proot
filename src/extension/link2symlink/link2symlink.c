@@ -937,8 +937,17 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	} else {
 		/*Move the original content to new location, by incrementing count at end of path. */
 		status = read_intermediate(intermediate, final);
-		if (status < 0)
-			return status;
+		if (status < 0) {
+			/* The tracee named one of the files this extension
+			 * keeps next to faked hard links -- it enumerated a
+			 * directory before these were hidden, or it kept the
+			 * name from an older build.  There is nothing to
+			 * count there; refuse rather than report the EINVAL
+			 * readlink(2) answers for a regular file, which tools
+			 * take as fatal instead of falling back to copying
+			 * (git clone --local, cp -al).  */
+			return status == -EINVAL ? -EPERM : status;
+		}
 
 		link_count = get_link_count(final);
 		if (link_count >= MAX_LINK_COUNT)
@@ -1242,9 +1251,13 @@ static int get_faked_hard_link_type(const char path[PATH_MAX])
  * a symbolic link where lstat(2) sees a regular file, then skip it or
  * trip over the contradiction.
  *
- * Intermediates are left alone: they are symbolic links to statx(2),
- * hence to most recent programs, even though the stat(2) family reports
- * them as the file they point to, c.f. handle_sysexit_end().
+ * Intermediates are hidden, and so are the files they stand for: both
+ * live next to the names they were faked from -- no PROOT_L2S_DIR is
+ * configured -- and both are this extension's own bookkeeping, which no
+ * tracee ever named, c.f. hide_internal_entries().  An intermediate is
+ * a symbolic link to statx(2), hence to most recent programs, even
+ * though the stat(2) family reports it as the file it points to, c.f.
+ * handle_sysexit_end().
  *
  * This syscall is never failed: an entry that can't be checked is left
  * as the kernel reported it.
@@ -1258,13 +1271,14 @@ static int handle_getdents_exit(Tracee *tracee)
 	size_t reclen_offset;
 	size_t name_offset;
 	size_t type_offset;
-	size_t first_modified;
-	size_t last_modified;
+	bool type_changed = false;
 	size_t offset;
 	size_t length;
+	size_t kept;
 	unsigned short reclen;
 	const char *name;
 	char *buffer;
+	char *compacted;
 	word_t address;
 	int status;
 	int fd;
@@ -1295,15 +1309,24 @@ static int handle_getdents_exit(Tracee *tracee)
 	}
 
 	buffer = talloc_size(tracee->ctx, length);
-	if (buffer == NULL)
+	compacted = talloc_size(tracee->ctx, length);
+	if (buffer == NULL || compacted == NULL)
 		return 0;
 
 	status = read_data(tracee, buffer, address, length);
 	if (status < 0)
 		return 0;
 
-	first_modified = length;
-	last_modified = 0;
+	/* Rebuild the listing without the files this extension keeps next
+	 * to the names it faked.  They are its own bookkeeping and no
+	 * tracee ever named them, so tools must not see them: a recursive
+	 * removal deletes them as ordinary entries -- and the count file
+	 * is renamed as the names go, so the tool's stale listing leaves a
+	 * file behind and rmdir(2) fails with "Directory not empty" --
+	 * while a tool that hard-links a whole directory, git clone --local
+	 * and cp -al included, tries to link an intermediate and used to
+	 * fail with EINVAL.  */
+	kept = 0;
 
 	for (offset = 0; offset + name_offset < length; offset += reclen) {
 		memcpy(&reclen, buffer + offset + reclen_offset, sizeof(reclen));
@@ -1313,11 +1336,31 @@ static int handle_getdents_exit(Tracee *tracee)
 		if (reclen < name_offset + 2 || reclen > length - offset)
 			break;
 
-		type_offset = (dirent64 ? 18 : reclen - 1u);
-		if ((unsigned char) buffer[offset + type_offset] != DT_LNK)
+		name = buffer + offset + name_offset;
+		if (memchr(name, '\0', reclen - name_offset) == NULL)
+			break;
+
+		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
 			continue;
 
-		name = buffer + offset + name_offset;
+		memcpy(compacted + kept, buffer + offset, reclen);
+		kept += reclen;
+	}
+
+	/* Nothing to hide in this chunk: leave it as the kernel wrote it.  */
+	if (kept == 0)
+		return 0;
+
+	for (offset = 0; offset + name_offset < kept; offset += reclen) {
+		memcpy(&reclen, compacted + offset + reclen_offset, sizeof(reclen));
+		if (reclen < name_offset + 2 || reclen > kept - offset)
+			break;
+
+		type_offset = (dirent64 ? 18 : reclen - 1u);
+		if ((unsigned char) compacted[offset + type_offset] != DT_LNK)
+			continue;
+
+		name = compacted + offset + name_offset;
 		if (memchr(name, '\0', reclen - name_offset) == NULL)
 			break;
 
@@ -1326,7 +1369,7 @@ static int handle_getdents_exit(Tracee *tracee)
 		if (!directory_known) {
 			status = readlink_proc_pid_fd(tracee->pid, fd, directory);
 			if (status < 0 || directory[0] != '/')
-				return 0;
+				break;
 			if (strcmp(directory, "/") == 0)
 				directory[0] = '\0';
 			directory_known = true;
@@ -1340,20 +1383,21 @@ static int handle_getdents_exit(Tracee *tracee)
 		if (status < 0 || status == DT_LNK)
 			continue;
 
-		buffer[offset + type_offset] = status;
-
-		if (first_modified == length)
-			first_modified = offset + type_offset;
-		last_modified = offset + type_offset;
+		compacted[offset + type_offset] = status;
+		type_changed = true;
 	}
 
-	if (first_modified == length)
+	/* Nothing was hidden and no type changed: the tracee's buffer
+	 * already holds what the kernel wrote.  */
+	if (kept == length && !type_changed)
 		return 0;
 
-	/* Only the span of the entries that changed: without
-	 * process_vm_writev(2), this is written word by word.  */
-	(void) write_data(tracee, address + first_modified, buffer + first_modified,
-			last_modified - first_modified + 1);
+	/* Write the records that stay, with the types they now carry.  The
+	 * result is the number of bytes actually handed back, so the
+	 * tracee never looks past the end of its own buffer.  */
+	if (kept > 0 && write_data(tracee, address, compacted, kept) < 0)
+		return 0;
+	poke_reg(tracee, SYSARG_RESULT, kept);
 
 	return 0;
 }

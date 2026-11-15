@@ -203,7 +203,7 @@ build_static "$L2S/open_nofollow.c" "$ROOTFS/bin/open_nofollow" || true
 # 6. Run the cases --------------------------------------------------------
 # These carry the acceptance criteria of the batch this suite was written
 # for; skipping one of them is not a pass.
-REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh test-l2s-readonly-unlink.sh"
+REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh test-l2s-readonly-unlink.sh test-l2s-hidden-internals.sh"
 
 pass=0
 skip=0
