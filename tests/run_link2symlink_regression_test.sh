@@ -128,6 +128,15 @@ if ! printf '#include <linux/ashmem.h>\nint main(void) { return 0; }\n' \
 #define ASHMEM_GET_NAME _IOR(__ASHMEMIOC, 2, char[ASHMEM_NAME_LEN])
 #define ASHMEM_SET_SIZE _IOW(__ASHMEMIOC, 3, size_t)
 #define ASHMEM_GET_SIZE _IO(__ASHMEMIOC, 4)
+#define ASHMEM_PIN _IOW(__ASHMEMIOC, 7, struct ashmem_pin)
+#define ASHMEM_UNPIN _IOW(__ASHMEMIOC, 8, struct ashmem_pin)
+#define ASHMEM_GET_PIN_STATUS _IO(__ASHMEMIOC, 9)
+#define ASHMEM_PURGE_ALL_CACHES _IO(__ASHMEMIOC, 10)
+
+struct ashmem_pin {
+	__u32 offset;
+	__u32 len;
+};
 
 #endif /* _LINUX_ASHMEM_H */
 ASHMEM
