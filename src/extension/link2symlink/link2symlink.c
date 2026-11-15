@@ -19,6 +19,7 @@
 #include "tracee/tracee.h"
 #include "tracee/mem.h"
 #include "tracee/statx.h"
+#include "syscall/chain.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
 #include "path/path.h"
@@ -1347,9 +1348,19 @@ static int handle_getdents_exit(Tracee *tracee)
 		kept += reclen;
 	}
 
-	/* Nothing to hide in this chunk: leave it as the kernel wrote it.  */
-	if (kept == 0)
+	/* This chunk held nothing but internal names, which happens in a
+	 * directory of many faked hard links.  Reporting an empty listing
+	 * would look like the end of the directory and hide the names that
+	 * come next, so ask for the following chunk instead.  */
+	if (kept == 0) {
+		word_t count = peek_reg(tracee, ORIGINAL, SYSARG_3);
+
+		register_chained_syscall(tracee,
+					dirent64 ? PR_getdents64 : PR_getdents,
+					fd, address, count, 0, 0, 0);
+		poke_reg(tracee, SYSARG_RESULT, 0);
 		return 0;
+	}
 
 	for (offset = 0; offset + name_offset < kept; offset += reclen) {
 		memcpy(&reclen, compacted + offset + reclen_offset, sizeof(reclen));
