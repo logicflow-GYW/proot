@@ -18,8 +18,9 @@ Every check names the criterion it stands for:
   A10 a descriptor opened through a faked hard link is named after it:
       the READLINK_PROC_FD event is emitted before the path is detranslated
   A5  the fork keeps its own error reporting (no bare `return status`)
-  fork  the guard which() needs (tracee->exe == NULL) is still there, no
-      openat2 work was pulled in, and native_offload is still declared
+  fork  the guard which() needs (tracee->exe == NULL) is still there,
+      openat2(2) is translated so its descriptors are named too, and
+      native_offload is still declared
 
 Usage: python3 probe/l2s_wiring_check.py [--root <tree>] [-v]
 Exit status: 0 when every check passed, 1 otherwise (2 on usage errors).
@@ -358,10 +359,15 @@ class Probe:
         open_syscall = self.tree.function_body(l2s, "is_open_syscall")
         self.expect(open_syscall is not None, "A10", "is_open_syscall exists")
         if open_syscall:
+            # The fork translates openat2(2) since the 2026-11-15 upstream
+            # merge (termux/proot 114a7c69), so a descriptor it returns is
+            # named after the l2s file and must be remembered like any
+            # other open(2).  Before that merge this arm asserted the
+            # opposite: the case was absent on purpose.
             self.expect(
-                "PR_openat2" not in self.tree.strip_comments(open_syscall),
+                "PR_openat2" in self.tree.strip_comments(open_syscall),
                 "fork",
-                "no openat2(2) reference: this fork doesn't translate it",
+                "openat2(2) is translated, so its descriptors are named too",
             )
 
         count = self.tree.function_body(l2s, "get_link_count")

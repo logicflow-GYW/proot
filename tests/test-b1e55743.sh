@@ -6,7 +6,7 @@ fi
 # link(2) is made of -- rename(2), symlink(2), readlink(2), ... -- to
 # the tracee as is, that is, as -EPERM, instead of their errno.
 
-DIR=${TMPDIR:?}/$(mcookie).l2s
+DIR=${TMPDIR:-/tmp}/$(mcookie).l2s
 SCRIPT_DIR=$(dirname "$0")
 mkdir -p "${DIR}/l2s"
 
@@ -24,7 +24,11 @@ echo 1 > a; echo 2 > b
 ./link a b; echo "exists $? $(cat a)"
 
 # The faked hard link is broken.
-./link a c; rm .l2s.a*
+./link a c
+# The backing files are hidden from listings -- hence from globs -- since
+# 2026-11-15; name the intermediate of "a" instead, c.f.
+# test-l2s-hidden-internals.sh.
+rm -f .l2s.a0001
 ./link c d; echo "broken $?"
 
 # The file can not be moved out of its directory.
