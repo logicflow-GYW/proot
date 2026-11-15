@@ -152,7 +152,9 @@ else
 fi
 
 say "== building PRoot${SHIMMED}"
-if ! env CC="$CC" LD="$LD" make -C "$BUILD/src" -j"$JOBS" $LOADER_32 >"$LOG" 2>&1; then
+# GNUmakefile assigns LD=$(CC), so environment-only LD is overridden.
+# Command-line assignments are required to keep lld for the freestanding loader.
+if ! make -C "$BUILD/src" CC="$CC" LD="$LD" -j"$JOBS" $LOADER_32 >"$LOG" 2>&1; then
 	say "FAIL: build failed; last lines of $LOG:"
 	tail -n 40 "$LOG"
 	say "      (keep the scratch tree with KEEP=1, or pass CC=/LD= yourself)"
@@ -192,7 +194,7 @@ build_static "$L2S/open_nofollow.c" "$ROOTFS/bin/open_nofollow" || true
 # 6. Run the cases --------------------------------------------------------
 # These carry the acceptance criteria of the batch this suite was written
 # for; skipping one of them is not a pass.
-REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh"
+REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh test-l2s-readonly-unlink.sh"
 
 pass=0
 skip=0
