@@ -179,17 +179,17 @@ MUTATIONS = [
         "fork",
     ),
     (
-        "fork: openat2(2) is referenced although this fork doesn't map it",
+        "fork: openat2(2) is no longer mapped although this fork translates it",
         L2S,
         """	case PR_creat:
 	case PR_open:
 	case PR_openat:
-		/* Note: no PR_openat2 here: this fork doesn't translate""",
+	case PR_openat2:
+		return true;""",
         """	case PR_creat:
 	case PR_open:
-	case PR_openat2:
 	case PR_openat:
-		/* Note: no PR_openat2 here: this fork doesn't translate""",
+		return true;""",
         "fork",
     ),
     (
