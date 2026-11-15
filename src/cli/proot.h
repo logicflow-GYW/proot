@@ -61,7 +61,9 @@ static int handle_option_i(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_R(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_S(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_link2symlink(Tracee *tracee, const Cli *cli, const char *value);
+#if defined(__ANDROID__) || defined(__BIONIC__)
 static int handle_option_ashmem_memfd(Tracee *tracee, const Cli *cli, const char *value);
+#endif /* defined(__ANDROID__) || defined(__BIONIC__) */
 static int handle_option_sysvipc(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_kill_on_exit(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_L(Tracee *tracee, const Cli *cli, const char *value);
@@ -78,7 +80,7 @@ static Cli proot_cli = {
 	.name     = "proot",
 	.subtitle = "chroot, mount --bind, and binfmt_misc without privilege/setup",
 	.synopsis = "proot [option] ... [command]",
-	.colophon = "Visit http://proot.me for help, bug reports, suggestions, patchs, ...\n\
+	.colophon = "Visit https://github.com/termux/proot/issues for help, bug reports, etc...\n\
 Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
 	.logo = "\
  _____ _____              ___\n\
@@ -254,6 +256,7 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
 \tsyscalls inside proot. IPC is handled inside proot and launching 2 proot instances\n\
 \twill lead to 2 different IPC Namespaces",
 	},
+#if defined(__ANDROID__) || defined(__BIONIC__)
 	{ .class = "Extension options",
 	  .arguments = {
 		{ .name = "--ashmem-memfd", .separator = '\0', .value = NULL },
@@ -262,6 +265,7 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
           .description = "Emulate memfd_create support through ashmem and simulate fstat.st_size for ashmem",
           .detail = "",
 	},
+#endif /* defined(__ANDROID__) || defined(__BIONIC__) */
         { .class = "Extension options",
           .arguments = {
                 { .name = "-H", .separator = '\0', .value = NULL },

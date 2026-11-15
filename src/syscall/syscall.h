@@ -57,5 +57,12 @@ extern int set_sysarg_data(Tracee *tracee, const void *tracer_ptr, word_t size, 
 extern void translate_syscall(Tracee *tracee);
 extern int  translate_syscall_enter(Tracee *tracee);
 extern void translate_syscall_exit(Tracee *tracee);
+extern bool is_voided_syscall(const Tracee *tracee, RegVersion version);
+
+extern void handle_netlink_reply_exit(Tracee *tracee, word_t syscall_number);
+
+extern void apply_emulated_mount(Tracee *tracee);
+extern void apply_emulated_pivot_root(Tracee *tracee);
+extern void apply_emulated_umount(Tracee *tracee);
 
 #endif /* SYSCALL_H */

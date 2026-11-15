@@ -340,15 +340,29 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_chown,		0 },
 	{ PR_chown32,		0 },
 	{ PR_chroot,		0 },
+	{ PR_clone,		0 },
+	{ PR_clone3,		0 },
+	{ PR_close,		0 },
 	{ PR_connect,		0 },
 	{ PR_creat,		0 },
+	{ PR_recvfrom,		0 },
+	{ PR_recvmsg,		0 },
+	{ PR_sendmmsg,		0 },
+	{ PR_sendmsg,		0 },
+	{ PR_sendto,		0 },
+	{ PR_socket,		FILTER_SYSEXIT },
 	{ PR_execve,		FILTER_SYSEXIT },
 	{ PR_execveat,		FILTER_SYSEXIT },
 	{ PR_faccessat,		0 },
 	{ PR_faccessat2,	FILTER_SYSEXIT },
 	{ PR_fchdir,		FILTER_SYSEXIT },
 	{ PR_fchmodat,		0 },
+	{ PR_fchmodat2,		0 },
 	{ PR_fchownat,		0 },
+	{ PR_fsconfig,		0 },
+	{ PR_fsmount,		0 },
+	{ PR_fsopen,		0 },
+	{ PR_fspick,		0 },
 	{ PR_fstatat64,		0 },
 	{ PR_futimesat,		0 },
 	{ PR_getcwd,		FILTER_SYSEXIT },
@@ -377,14 +391,19 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_mkdirat,		0 },
 	{ PR_mknod,		0 },
 	{ PR_mknodat,		0 },
-	{ PR_mount,		0 },
+	{ PR_mount,		FILTER_SYSEXIT },
+	{ PR_mount_setattr,	0 },
+	{ PR_move_mount,	0 },
 	{ PR_name_to_handle_at,	0 },
 	{ PR_newfstatat,	0 },
 	{ PR_oldlstat,		0 },
 	{ PR_oldstat,		0 },
 	{ PR_open,		0 },
+	{ PR_open_tree,		0 },
+	{ PR_open_tree_attr,	0 },
 	{ PR_openat,		0 },
-	{ PR_pivot_root,	0 },
+	{ PR_openat2,		0 },
+	{ PR_pivot_root,	FILTER_SYSEXIT },
 	{ PR_prctl, 		0 },
 	{ PR_prlimit64,		FILTER_SYSEXIT },
 	{ PR_ptrace,		FILTER_SYSEXIT },
@@ -409,9 +428,11 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_symlinkat,		0 },
 	{ PR_truncate,		0 },
 	{ PR_truncate64,	0 },
-	{ PR_umount,		0 },
-	{ PR_umount2,		0 },
+	{ PR_umount,		FILTER_SYSEXIT },
+	{ PR_umount2,		FILTER_SYSEXIT },
 	{ PR_uname,		FILTER_SYSEXIT },
+	{ PR_unshare,		FILTER_SYSEXIT },
+	{ PR_setns,		FILTER_SYSEXIT },
 	{ PR_unlink,		0 },
 	{ PR_unlinkat,		0 },
 	{ PR_uselib,		0 },
@@ -511,12 +532,50 @@ int enable_syscall_filtering(const Tracee *tracee)
 	return 0;
 }
 
+/**
+ * Return the flags the filter of enable_syscall_filtering() associates
+ * with @sysnum for @tracee, ie. the data PTRACE_EVENT_SECCOMP stops of
+ * that syscall report: the filter was built from the very same lists.
+ */
+int filtered_sysnum_flags(const Tracee *tracee, Sysnum sysnum)
+{
+	Extension *extension;
+	int flags = 0;
+	size_t i;
+
+	for (i = 0; proot_sysnums[i].value != PR_void; i++) {
+		if (proot_sysnums[i].value == sysnum)
+			flags |= proot_sysnums[i].flags;
+	}
+
+	if (tracee->extensions == NULL)
+		return flags;
+
+	LIST_FOREACH(extension, tracee->extensions, link) {
+		if (extension->filtered_sysnums == NULL)
+			continue;
+
+		for (i = 0; extension->filtered_sysnums[i].value != PR_void; i++) {
+			if (extension->filtered_sysnums[i].value == sysnum)
+				flags |= extension->filtered_sysnums[i].flags;
+		}
+	}
+
+	return flags;
+}
+
 #else
 
+#include "syscall/seccomp.h"
 #include "tracee/tracee.h"
 #include "attribute.h"
 
 int enable_syscall_filtering(const Tracee *tracee UNUSED)
+{
+	return 0;
+}
+
+int filtered_sysnum_flags(const Tracee *tracee UNUSED, Sysnum sysnum UNUSED)
 {
 	return 0;
 }

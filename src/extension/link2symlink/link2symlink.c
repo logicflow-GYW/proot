@@ -332,10 +332,7 @@ static bool is_open_syscall(Sysnum sysnum)
 	case PR_creat:
 	case PR_open:
 	case PR_openat:
-		/* Note: no PR_openat2 here: this fork doesn't translate
-		 * openat2(2) yet, so a descriptor it returns is named by
-		 * the kernel after the l2s file, as before.  Carry this
-		 * case over when openat2 support gets ported.  */
+	case PR_openat2:
 		return true;
 
 	default:

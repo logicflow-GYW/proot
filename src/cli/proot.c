@@ -294,6 +294,7 @@ static int handle_option_link2symlink(Tracee *tracee, const Cli *cli UNUSED, con
 	return 0;
 }
 
+#if defined(__ANDROID__) || defined(__BIONIC__)
 static int handle_option_ashmem_memfd(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
 	int status;
@@ -305,6 +306,7 @@ static int handle_option_ashmem_memfd(Tracee *tracee, const Cli *cli UNUSED, con
 
 	return 0;
 }
+#endif /* defined(__ANDROID__) || defined(__BIONIC__) */
 
 static int handle_option_sysvipc(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
@@ -365,19 +367,12 @@ static int post_initialize_exe(Tracee *tracee, const Cli *cli UNUSED,
 	if (tracee->qemu == NULL)
 		return 0;
 
-	/* Resolve the full guest path to tracee->qemu[0].  */
+	/* Resolve the full path to tracee->qemu[0].  Actually it has to
+	 * be a host path from the tracee's point-of-view, not from the
+	 * PRoot's point-of-view.  See translate_execve() for details.  */
 	status = which(tracee->reconf.tracee, tracee->reconf.paths, path, tracee->qemu[0]);
 	if (status < 0)
 		return -1;
-
-	/* Actually tracee->qemu[0] has to be a host path from the tracee's
-	 * point-of-view, not from the PRoot's point-of-view.  See
-	 * translate_execve() for details.  */
-	if (tracee->reconf.tracee != NULL) {
-		status = detranslate_path(tracee->reconf.tracee, path, NULL);
-		if (status < 0)
-			return -1;
-	}
 
 	tracee->qemu[0] = talloc_strdup(tracee->qemu, path);
 	if (tracee->qemu[0] == NULL)
