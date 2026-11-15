@@ -251,9 +251,9 @@ class Probe:
         if getdents:
             stripped = self.tree.strip_comments(getdents)
             self.expect(
-                "type_offset" in stripped and "buffer[offset + type_offset] = status" in stripped,
+                "compacted[offset + type_offset] = status" in stripped,
                 "A3",
-                "getdents(2) types are rewritten in place",
+                "the entries kept get the type of the file they stand for",
             )
             for field in ("d_ino", "d_off", "d_reclen"):
                 self.expect(
@@ -261,21 +261,34 @@ class Probe:
                     "A3",
                     f"handle_getdents_exit() doesn't touch {field}",
                 )
-            writes = re.findall(r"buffer\[[^\]]*\]\s*=[^=]", stripped)
+            writes = re.findall(r"compacted\[[^\]]*\]\s*=[^=]", stripped)
             self.expect(
                 len(writes) == 1 and "type_offset" in writes[0],
                 "A3",
-                "handle_getdents_exit() writes one byte per entry, the type one",
+                "handle_getdents_exit() only ever writes the type byte of an entry",
                 f"writes: {writes}",
             )
             self.expect(
+                re.search(r"write_data\(tracee, address, compacted, kept\)", stripped) is not None
+                and re.search(r"poke_reg\(tracee, SYSARG_RESULT, kept\)", stripped) is not None,
+                "A3",
+                "the compacted listing is written back, with its own length as the result",
+            )
+            self.expect(
                 re.search(
-                    r"write_data\(tracee, address \+ first_modified, buffer \+ first_modified,\s*\n?\s*last_modified - first_modified \+ 1\)",
+                    r"strncmp\(name, PREFIX, strlen\(PREFIX\)\) == 0\)\s*\n\s*continue;",
                     stripped,
                 )
                 is not None,
                 "A3",
-                "only the span of the rewritten types is written back",
+                "the backing files this extension keeps are dropped from the listing",
+                "they are its own bookkeeping; tools list, delete and hard-link them otherwise",
+            )
+            self.expect(
+                re.search(r"register_chained_syscall\(tracee,", stripped) is not None,
+                "A3",
+                "a chunk that held nothing but backing files asks for the next one",
+                "reporting an empty listing would look like the end of the directory",
             )
             self.expect(
                 "DT_LNK" in stripped,

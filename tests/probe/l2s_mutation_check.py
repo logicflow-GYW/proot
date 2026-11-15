@@ -83,16 +83,25 @@ MUTATIONS = [
     (
         "A3: getdents(2) hands the kernel result back untouched",
         L2S,
-        """		buffer[offset + type_offset] = status;""",
+        """		compacted[offset + type_offset] = status;""",
         """		(void) status;""",
         "A3",
     ),
     (
         "A3: getdents(2) also rewrites the entry offset",
         L2S,
-        """		buffer[offset + type_offset] = status;""",
-        """		buffer[offset + type_offset] = status;
-		buffer[offset + 8] = 0;  /* d_off */""",
+        """		compacted[offset + type_offset] = status;""",
+        """		compacted[offset + type_offset] = status;
+		compacted[offset + 8] = 0;  /* d_off */""",
+        "A3",
+    ),
+    (
+        "A3: the backing files are handed to the tracee again",
+        L2S,
+        """		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+			continue;""",
+        """		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+			;""",
         "A3",
     ),
     (
