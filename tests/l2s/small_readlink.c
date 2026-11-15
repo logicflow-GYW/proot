@@ -36,7 +36,9 @@ int main(int argc, char **argv)
 		char *end = NULL;
 		long value = strtol(argv[2], &end, 10);
 
-		if (end == argv[2] || *end != '\0' || value < 2 || value > 4096)
+		/* < sizeof(small): a buffer of 4096 would make small[4096]='\0'
+		 * write past the array. */
+		if (end == argv[2] || *end != '\0' || value < 2 || value >= (long) sizeof(small))
 			return 2;
 		small_size_wanted = (size_t) value;
 	}
