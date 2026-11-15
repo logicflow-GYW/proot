@@ -134,6 +134,21 @@ MUTATIONS = [
         "A10",
     ),
     (
+        "A10: a truncated answer is dropped before recall_fd()",
+        L2S,
+        """	if (!is_l2s_file(state->host_path) && !state->truncated)""",
+        """	if (!is_l2s_file(state->host_path))""",
+        "A10",
+    ),
+    (
+        "A10: a truncated answer is only matched exactly",
+        L2S,
+        """			if (!truncated || rank != 0)
+				continue;""",
+        """			continue;""",
+        "A10",
+    ),
+    (
         "A10: exit.c reports a substituted path as untouched",
         "src/syscall/exit.c",
         """			if (!proc_fd.substituted)

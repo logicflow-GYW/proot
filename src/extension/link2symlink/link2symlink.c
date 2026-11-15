@@ -575,11 +575,13 @@ static void remember_fd(pid_t pid, int fd, const char link[PATH_MAX])
  * that opened the file.  Whatever the entry, it is only returned when it
  * still resolves to @host_path, so a stale one is never reported.
  */
-static const char *recall_fd(pid_t pid, int fd, const char host_path[PATH_MAX])
+static const char *recall_fd(pid_t pid, int fd, const char host_path[PATH_MAX],
+			     bool truncated)
 {
 	const char *best = NULL;
 	int best_rank = 3;
 	char final[PATH_MAX];
+	size_t host_length = strlen(host_path);
 	size_t index;
 
 	for (index = 0; index < FD_CACHE_SIZE; index++) {
@@ -598,8 +600,32 @@ static const char *recall_fd(pid_t pid, int fd, const char host_path[PATH_MAX])
 
 		if (resolve_faked_hard_link(fd_cache[index].link, final) < 0)
 			continue;
-		if (strcmp(final, host_path) != 0)
-			continue;
+
+		if (strcmp(final, host_path) != 0) {
+			/* readlink(2) reports at most the tracee's buffer
+			 * size and doesn't tell the name was longer, so a
+			 * small buffer hands back a prefix of the name the
+			 * kernel would have given -- a prefix of the host
+			 * path here.  The entry of the very descriptor of
+			 * this process is the file it was last opened on:
+			 * the cache holds one entry per descriptor, and
+			 * remember_fd() replaces it, so no other file can
+			 * hide behind that prefix.  Entries of other
+			 * descriptors or processes are only trusted on an
+			 * exact match, since they may name another file
+			 * that shares the prefix.  */
+			if (!truncated || rank != 0)
+				continue;
+			/* A one-byte answer ("/") is a prefix of every
+			 * path: require enough of it to tell names apart
+			 * before trusting the entry of this descriptor.
+			 * busybox reads tens of bytes, and so does the
+			 * device measurement this fixes.  */
+			if (host_length < 8 || host_length >= strlen(final))
+				continue;
+			if (strncmp(final, host_path, host_length) != 0)
+				continue;
+		}
 
 		best = fd_cache[index].link;
 		best_rank = rank;
@@ -620,13 +646,17 @@ static void readlink_proc_fd(struct readlink_proc_fd_state *state)
 	const char *link;
 
 	/* Only files that live in the l2s directory are reported by the
-	 * kernel under a name no tracee ever used.  */
-	if (!is_l2s_file(state->host_path))
+	 * kernel under a name no tracee ever used.  A truncated answer
+	 * may not carry enough of the name to tell -- readlink(2) stops
+	 * at the tracee's buffer size -- so it is matched against the
+	 * entry of the very descriptor of this process instead, c.f.
+	 * recall_fd(); every other entry still needs an exact answer.  */
+	if (!is_l2s_file(state->host_path) && !state->truncated)
 		return;
 
 	/* Descriptor numbers get reused and links get removed: the name
 	 * returned is ensured to lead to this very file.  */
-	link = recall_fd(state->pid, state->fd, state->host_path);
+	link = recall_fd(state->pid, state->fd, state->host_path, state->truncated);
 	if (link == NULL)
 		return;
 

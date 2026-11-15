@@ -333,6 +333,51 @@ class Probe:
                 "A10",
                 "readlink_proc_fd() only reports a name that still leads to this file",
             )
+            self.expect(
+                re.search(r"if\s*\(\s*!is_l2s_file\(state->host_path\)\s*&&\s*!state->truncated\s*\)", stripped) is not None,
+                "A10",
+                "readlink_proc_fd() still looks at a truncated answer the kernel gave",
+                "a truncated name has no count suffix: is_l2s_file() can't tell, so "
+                "the answer has to reach recall_fd() for the entry of the very descriptor",
+            )
+            self.expect(
+                "state->truncated" in stripped,
+                "A10",
+                "readlink_proc_fd() tells recall_fd() whether the kernel's answer was truncated",
+                "readlink(2) reports at most the tracee's buffer size and says nothing "
+                "when the name was longer: busybox's readlink(1) got the backing file "
+                "name, or the host path of the app, through a short buffer",
+            )
+
+        recall = self.tree.function_body(l2s, "recall_fd")
+        self.expect(recall is not None, "A10", "recall_fd exists")
+        if recall:
+            stripped = self.tree.strip_comments(recall)
+            self.expect(
+                re.search(r"if\s*\(\s*!truncated\s*\|\|\s*rank\s*!=\s*0\s*\)", stripped) is not None,
+                "A10",
+                "a truncated answer is only matched against the entry of the very descriptor",
+                "the cache holds one entry per descriptor, replaced on every open, so the "
+                "prefix belongs to the file it was last opened on; entries of other "
+                "descriptors or processes are only trusted on an exact match",
+            )
+            self.expect(
+                re.search(r"strncmp\(final,\s*host_path,\s*host_length\)", stripped) is not None,
+                "A10",
+                "the truncated answer is matched as a prefix of the recorded name",
+            )
+            self.expect(
+                re.search(r"host_length\s*<\s*8", stripped) is not None,
+                "A10",
+                "a one-byte answer is a prefix of every path: a floor keeps it from matching all",
+            )
+
+        exit_tree = self.tree.read("src/syscall/exit.c")
+        self.expect(
+            "proc_fd.truncated" in exit_tree,
+            "A10",
+            "the readlink exit handler reports whether the kernel's answer was truncated",
+        )
 
         translated = self.tree.function_body(l2s, "translated_path")
         self.expect(translated is not None, "A10", "translated_path exists")

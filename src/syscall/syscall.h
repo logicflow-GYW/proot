@@ -48,6 +48,13 @@ struct readlink_proc_fd_state {
 
 	/* Whether @host_path was replaced by an extension.  */
 	bool substituted;
+
+	/* Whether the kernel's answer filled the tracee's buffer, hence
+	 * may have been truncated: readlink(2) reports at most @max_size
+	 * bytes, without any hint that the name was longer.  An extension
+	 * matching @host_path against full names has to take that into
+	 * account.  */
+	bool truncated;
 };
 
 extern int get_sysarg_path(const Tracee *tracee, char path[PATH_MAX], Reg reg);

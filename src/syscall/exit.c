@@ -377,6 +377,7 @@ void translate_syscall_exit(Tracee *tracee)
 		word_t output;
 		struct readlink_proc_fd_state proc_fd = {
 			.pid = 0, .fd = -1, .host_path = referee, .substituted = false,
+			.truncated = false,
 		};
 
 		/* Error reported by the kernel.  */
@@ -410,6 +411,11 @@ void translate_syscall_exit(Tracee *tracee)
 		if (status < 0)
 			break;
 		referee[old_size] = '\0';
+
+		/* readlink(2) reports at most @max_size bytes and doesn't
+		 * tell whether the name was longer: a full buffer means the
+		 * answer may be truncated, c.f. recall_fd().  */
+		proc_fd.truncated = ((size_t) old_size >= max_size);
 
 		/* Not optimal but safe (path is fully translated).  */
 		status = read_path(tracee, referer, input);

@@ -63,6 +63,8 @@ python3 tests/probe/l2s_mutation_check.py        # negative controls
 | `test-l2s-legacy-chain.sh` | a chain left on disk by the previous version keeps working: read, count, link, unlink, delete |
 | `test-l2s-readonly-unlink.sh` | removing a faked hard link from a 0555 directory (openminis#375), as a normal user |
 | `test-l2s-hidden-internals.sh` | the backing files stay out of listings, `rm -rf` cleans up, and `cp -al` / `git clone --local` keep working |
+| `test-l2s-small-buffer-readlink.sh` | a small buffer in `readlink(2)` -- busybox's chunk size -- reports neither a backing file name nor the host path of the app |
+| `test-l2s-backed-dir-removal.sh` | with `PROOT_L2S_DIR`, a tree whose chain owner sits in a subdirectory is removed in one `rm -rf` pass |
 | `test-7fa2c1d4.sh`, `test-b9d41e62.sh`, `test-d4187784.sh` | `/proc/<pid>/fd/<fd>` names the file the way the tracee opened it, `O_NOFOLLOW` included |
 | `test-f3a8c2e1.sh`, `test-f3a8c2e2.sh` | `/proc/<pid>/exe` names the faked hard link, execveat included |
 | `test-02686ecd.sh` | a path whose translation failed is not handed to the emulation |

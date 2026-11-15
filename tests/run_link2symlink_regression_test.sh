@@ -199,11 +199,12 @@ build_static() {
 
 build_static "$HERE/puts_proc_self_exe.c" "$ROOTFS/bin/puts_proc_self_exe" || true
 build_static "$L2S/open_nofollow.c" "$ROOTFS/bin/open_nofollow" || true
+build_static "$L2S/small_readlink.c" "$ROOTFS/bin/small_readlink" || true
 
 # 6. Run the cases --------------------------------------------------------
 # These carry the acceptance criteria of the batch this suite was written
 # for; skipping one of them is not a pass.
-REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh test-l2s-readonly-unlink.sh test-l2s-hidden-internals.sh"
+REQUIRED="test-9f16ee06.sh test-ad207330.sh test-4e91b60a.sh test-l2s-legacy-chain.sh test-l2s-readonly-unlink.sh test-l2s-hidden-internals.sh test-l2s-small-buffer-readlink.sh test-l2s-backed-dir-removal.sh"
 
 pass=0
 skip=0
