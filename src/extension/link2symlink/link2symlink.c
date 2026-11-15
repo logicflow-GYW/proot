@@ -1273,6 +1273,7 @@ static int handle_getdents_exit(Tracee *tracee)
 	size_t name_offset;
 	size_t type_offset;
 	bool type_changed = false;
+	bool hide;
 	size_t offset;
 	size_t length;
 	size_t kept;
@@ -1328,6 +1329,22 @@ static int handle_getdents_exit(Tracee *tracee)
 	 * and cp -al included, tries to link an intermediate and used to
 	 * fail with EINVAL.  */
 	kept = 0;
+	hide = true;
+
+	/* The backing files are this extension's own bookkeeping, so they
+	 * are hidden from the tracee.  Not from the dedicated directory
+	 * though, when one is configured: that directory is theirs alone,
+	 * nothing else lives there, and hiding them would make it
+	 * impossible to remove it.  */
+	if (get_l2s_directory()) {
+		status = readlink_proc_pid_fd(tracee->pid, fd, directory);
+		if (status == 0 && directory[0] == '/') {
+			if (strcmp(directory, "/") == 0)
+				directory[0] = '\0';
+			directory_known = true;
+			hide = strcmp(directory, l2s_directory) != 0;
+		}
+	}
 
 	for (offset = 0; offset + name_offset < length; offset += reclen) {
 		memcpy(&reclen, buffer + offset + reclen_offset, sizeof(reclen));
@@ -1341,7 +1358,7 @@ static int handle_getdents_exit(Tracee *tracee)
 		if (memchr(name, '\0', reclen - name_offset) == NULL)
 			break;
 
-		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+		if (hide && strncmp(name, PREFIX, strlen(PREFIX)) == 0)
 			continue;
 
 		memcpy(compacted + kept, buffer + offset, reclen);
