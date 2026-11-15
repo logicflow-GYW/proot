@@ -98,9 +98,9 @@ MUTATIONS = [
     (
         "A3: the backing files are handed to the tracee again",
         L2S,
-        """		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+        """		if (hide && strncmp(name, PREFIX, strlen(PREFIX)) == 0)
 			continue;""",
-        """		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+        """		if (hide && strncmp(name, PREFIX, strlen(PREFIX)) == 0)
 			;""",
         "A3",
     ),
