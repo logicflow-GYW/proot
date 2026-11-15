@@ -345,6 +345,19 @@ int fetch_array_of_xpointers(Tracee *tracee, ArrayOfXPointers **array_, Reg reg,
 	return 0;
 }
 
+/* Minis (FIX-261031-12, 1c): size and address of the block the last
+ * push_array_of_xpointers() call allocated (0 / 0 until it got that
+ * far), so a caller whose push failed can say where it was writing.
+ * Read only on that failure path; the tracer is single-threaded.  */
+static size_t last_push_size = 0;
+static word_t last_push_ptr = 0;
+
+void last_push_of_xpointers(size_t *size, word_t *address)
+{
+	*size = last_push_size;
+	*address = last_push_ptr;
+}
+
 /**
  * Copy @array into tracee's memory space, then put in @reg the
  * address where it was copied.  This function returns -errno if an
@@ -360,6 +373,9 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	word_t tracee_ptr;
 	int status;
 	size_t i;
+
+	last_push_size = 0;
+	last_push_ptr = 0;
 
 	/* Nothing to do, for sure.  */
 	if (array == NULL)
@@ -410,10 +426,27 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	if (local_count == 1)
 		return 0;
 	assert(local_count < array->length + 1);
+	last_push_size = total_size;
 
 	/* Modified pointees and the pod array are stored in a tracee's
 	 * memory block.  */
+#if defined(ARCH_ARM64)
+	/* Minis (FIX-261031-12): AArch64 wants SP 16-byte aligned, and
+	 * this block (8 bytes per pointer + the strings) is any size, so
+	 * the argv[] table of a script landed at mod16 = 1, 9, ...  Pad
+	 * below the block the way upstream 28baec5 pads the load script
+	 * in execve/exit.c: the returned address itself is aligned, the
+	 * padding sits between the end of the data and the old SP and is
+	 * never written or referenced, and every offset inside the block
+	 * stays relative to its start.  RED_ZONE_SIZE is 0 on AArch64, so
+	 * alloc_mem() takes exactly this size.  */
+	{
+		const word_t stack_pointer = peek_reg(tracee, CURRENT, STACK_POINTER);
+		tracee_ptr = alloc_mem(tracee, total_size + (stack_pointer - total_size) % 16);
+	}
+#else
 	tracee_ptr = alloc_mem(tracee, total_size);
+#endif
 	if (tracee_ptr == 0)
 		return -E2BIG;
 
@@ -430,6 +463,7 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	}
 
 	/* Write all the modified pointees and the pod array at once.  */
+	last_push_ptr = tracee_ptr;
 	status = writev_data(tracee, tracee_ptr, local, local_count);
 	if (status < 0)
 		return status;

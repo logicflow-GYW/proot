@@ -23,10 +23,13 @@
 #include <assert.h>      /* assert(3), */
 #include <stdint.h>      /* intptr_t, */
 #include <errno.h>       /* E*, */
+#include <stdio.h>       /* FILE, fopen(3), fgets(3), sscanf(3), fclose(3), */
+#include <fcntl.h>       /* O_PATH, */
 #include <sys/stat.h>    /* chmod(2), stat(2) */
 #include <sys/types.h>   /* uid_t, gid_t, get*id(2), */
 #include <unistd.h>      /* get*id(2),  */
 #include <sys/ptrace.h>  /* linux.git:c0a3a20b  */
+#include <sys/prctl.h>   /* PR_SET_KEEPCAPS, PR_GET_KEEPCAPS, */
 #include <linux/audit.h> /* AUDIT_ARCH_*,  */
 #include <string.h>      /* memcpy(3), */
 #include <stdlib.h>      /* strtol(3), */
@@ -70,12 +73,51 @@
 #endif
 
 /**
- * Copy config->@field to the tracee's memory location pointed to by @sysarg.
+ * Return true if @sysnum is the legacy getresuid/getresgid of a 32-bit
+ * ABI, which reports 16-bit IDs; getres[ug]id32 and the syscalls of
+ * 64-bit ABIs report 32-bit IDs.
  */
-#define POKE_MEM_ID(sysarg, field) do {					\
-	poke_uint16(tracee, peek_reg(tracee, ORIGINAL, sysarg), config->field);	\
+static bool is_16bit_id_syscall(const Tracee *tracee, Sysnum sysnum)
+{
+	if (sysnum != PR_getresuid && sysnum != PR_getresgid)
+		return false;
+#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
+	return get_abi(tracee) == ABI_2;
+#else
+	(void) tracee;
+	return true;
+#endif
+}
+
+/**
+ * Copy config->@field to the tracee's memory location pointed to by
+ * @sysarg, 16 or 32 bits wide according to @sysnum.  Android apps
+ * outside the owner user have IDs above 65535, so a 16-bit write
+ * would leave their high bits in the tracee's 32-bit uid_t.
+ */
+#define POKE_MEM_ID(sysnum, sysarg, field) do {				\
+	word_t address = peek_reg(tracee, ORIGINAL, sysarg);		\
+	if (is_16bit_id_syscall(tracee, sysnum))			\
+		poke_uint16(tracee, address, config->field);		\
+	else								\
+		poke_uint32(tracee, address, config->field);		\
 	if (errno != 0)							\
 		return -errno;						\
+} while (0)
+
+/**
+ * Clear the fake CAP_SETUID/CAP_SETGID flag (caps_active) when a setuid-
+ * family syscall has just performed a "permanent" privilege drop: at
+ * least one of r/e/s uid was 0 before the call and none is 0 after.
+ * This mirrors the Linux rule that clears capabilities on such a
+ * transition, unless prctl(PR_SET_KEEPCAPS, 1) was used.  Operates on
+ * the current Config in scope.
+ */
+#define MAYBE_DROP_CAPS(prev_root) do {					\
+	if ((prev_root) && !config->keep_caps				\
+	    && config->ruid != 0 && config->euid != 0			\
+	    && config->suid != 0)					\
+		config->caps_active = false;				\
 } while (0)
 
 /**
@@ -83,22 +125,25 @@
  */
 #define SETXID(id, version) do {					\
 	id ## _t id = peek_reg(tracee, version, SYSARG_1);		\
+	bool prev_root = (config->ruid == 0 || config->euid == 0	\
+			  || config->suid == 0);			\
 	bool allowed;							\
 									\
 	/* "EPERM: The user is not privileged (does not have the	\
 	 * CAP_SETUID capability) and uid does not match the real UID	\
 	 * or saved set-user-ID of the calling process." -- man		\
 	 * setuid */							\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->caps_active		\
 		|| id == config->r ## id				\
 		|| id == config->e ## id				\
 		|| id == config->s ## id);				\
 	if (!allowed)							\
 		return -EPERM;						\
 									\
-	/* "If the effective UID of the caller is root, the real UID	\
-	 * and saved set-user-ID are also set." -- man setuid */	\
-	if (config->euid == 0) {					\
+	/* "If the effective UID of the caller is root [or it holds	\
+	 * CAP_SETUID], the real UID and saved set-user-ID are also	\
+	 * set." -- man setuid */					\
+	if (config->euid == 0 || config->caps_active) {			\
 		config->r ## id = id;					\
 		config->s ## id = id;					\
 	}								\
@@ -108,6 +153,8 @@
 	 * man setfsuid */						\
 	config->e ## id  = id;						\
 	config->fs ## id = id;						\
+									\
+	MAYBE_DROP_CAPS(prev_root);					\
 									\
 	poke_reg(tracee, SYSARG_RESULT, 0);				\
 	return 0;							\
@@ -129,6 +176,8 @@
 #define SETREXID(id, version) do {					\
 	id ## _t r ## id = peek_reg(tracee, version, SYSARG_1); 	\
 	id ## _t e ## id = peek_reg(tracee, version, SYSARG_2); 	\
+	bool prev_root = (config->ruid == 0 || config->euid == 0	\
+			  || config->suid == 0);			\
 	bool allowed;							\
 									\
 	/* "Unprivileged processes may only set the effective user ID	\
@@ -149,7 +198,7 @@
 	 *								\
 	 * Is it possible to "ruid <- euid" and "euid <- suid" at the	\
 	 * same time?  */						\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->caps_active		\
 		|| (UNCHANGED_ID(e ## id) && UNCHANGED_ID(r ## id))	\
 		|| (r ## id == config->e ## id && (e ## id == config->r ## id || UNCHANGED_ID(e ## id))) \
 		|| (e ## id == config->r ## id && (r ## id == config->e ## id || UNCHANGED_ID(r ## id))) \
@@ -179,6 +228,8 @@
 		config->r ## id = r ## id;				\
 	}								\
 									\
+	MAYBE_DROP_CAPS(prev_root);					\
+									\
 	poke_reg(tracee, SYSARG_RESULT, 0);				\
 	return 0;							\
 } while (0)
@@ -197,6 +248,8 @@
 	type ## id_t r ## type ## id = peek_reg(tracee, version, SYSARG_1);	\
 	type ## id_t e ## type ## id = peek_reg(tracee, version, SYSARG_2);	\
 	type ## id_t s ## type ## id = peek_reg(tracee, version, SYSARG_3);	\
+	bool prev_root = (config->ruid == 0 || config->euid == 0	\
+			  || config->suid == 0);			\
 	bool allowed;							\
 									\
 	/* "Unprivileged user processes may change the real UID,	\
@@ -207,7 +260,7 @@
 	 * Privileged processes (on Linux, those having the CAP_SETUID	\
 	 * capability) may set the real UID, effective UID, and saved	\
 	 * set-user-ID to arbitrary values." -- man setresuid */	\
-	allowed = (config->euid == 0 /* || HAS_CAP(SETUID) */		\
+	allowed = (config->euid == 0 || config->caps_active		\
 		|| ((UNSET_ID(r ## type ## id) || EQUALS_ANY_ID(r ## type ## id, type)) \
 		 && (UNSET_ID(e ## type ## id) || EQUALS_ANY_ID(e ## type ## id, type)) \
 		 && (UNSET_ID(s ## type ## id) || EQUALS_ANY_ID(s ## type ## id, type)))); \
@@ -230,6 +283,8 @@
 	if (!UNSET_ID(s ## type ## id))					\
 		config->s ## type ## id = s ## type ## id;		\
 									\
+	MAYBE_DROP_CAPS(prev_root);					\
+									\
 	poke_reg(tracee, SYSARG_RESULT, 0);				\
 	return 0;							\
 } while (0)
@@ -246,7 +301,7 @@
 	 * superuser or if fsuid matches either the real user ID,	\
 	 * effective user ID, saved set-user-ID, or the current value	\
 	 * of fsuid." -- man setfsuid */				\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->caps_active		\
 		|| fs ## type ## id == config->fs ## type ## id		\
 		|| EQUALS_ANY_ID(fs ## type ## id, type));		\
 	if (allowed)							\
@@ -275,6 +330,9 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_linkat,		FILTER_SYSEXIT },
 	{ PR_mkdir,		FILTER_SYSEXIT },
 	{ PR_mkdirat,		FILTER_SYSEXIT },
+	{ PR_rename,		FILTER_SYSEXIT },
+	{ PR_renameat,		FILTER_SYSEXIT },
+	{ PR_renameat2,		FILTER_SYSEXIT },
 	{ PR_symlink,		FILTER_SYSEXIT },
 	{ PR_symlinkat,		FILTER_SYSEXIT },
 	{ PR_umask,		FILTER_SYSEXIT },
@@ -290,6 +348,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_execve,		FILTER_SYSEXIT },
 	{ PR_fchmod,		FILTER_SYSEXIT },
 	{ PR_fchmodat,		FILTER_SYSEXIT },
+	{ PR_fchmodat2,		FILTER_SYSEXIT },
 	{ PR_fchown,		FILTER_SYSEXIT },
 	{ PR_fchown32,		FILTER_SYSEXIT },
 	{ PR_fchownat,		FILTER_SYSEXIT },
@@ -320,6 +379,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_newfstatat,	FILTER_SYSEXIT },
 	{ PR_oldlstat,		FILTER_SYSEXIT },
 	{ PR_oldstat,		FILTER_SYSEXIT },
+	{ PR_prctl,		FILTER_SYSEXIT },
 	{ PR_sendmsg,		0 },
 	{ PR_setfsgid,		FILTER_SYSEXIT },
 	{ PR_setfsgid32,	FILTER_SYSEXIT },
@@ -417,6 +477,22 @@ static void override_permissions(const Tracee *tracee, const char *path, bool is
 			node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
 			break;
 
+		case PR_fchmodat2: {
+			struct stat link;
+
+			/* The mode of a symlink can't be changed: with
+			 * AT_SYMLINK_NOFOLLOW the syscall fails with EOPNOTSUPP
+			 * and leaves everything as is.  Don't hand the new mode
+			 * over to the target of the symlink, which is the file
+			 * stat(2) above looked at; restore its previous mode.  */
+			if ((peek_reg(tracee, ORIGINAL, SYSARG_4) & AT_SYMLINK_NOFOLLOW) != 0
+			    && lstat(path, &link) == 0 && S_ISLNK(link.st_mode))
+				node->mode = perms.st_mode;
+			else
+				node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
+			break;
+		}
+
 		/* For stat syscalls: don't touch the mode of the final component.  */
 		case PR_fstatat64:
 		case PR_lstat:
@@ -428,6 +504,7 @@ static void override_permissions(const Tracee *tracee, const char *path, bool is
 		case PR_stat64:
 		case PR_statfs:
 		case PR_statfs64:
+		case PR_statx:
 			return;
 
 		/* Otherwise: restore the previous mode of the final component.  */
@@ -527,17 +604,17 @@ static int handle_perm_err_exit_end(Tracee *tracee, Config *config, bool even_if
 	return 0;
 }
 
-static int handle_getresuid_exit_end(Tracee *tracee, Config *config) {
-	POKE_MEM_ID(SYSARG_1, ruid);
-	POKE_MEM_ID(SYSARG_2, euid);
-	POKE_MEM_ID(SYSARG_3, suid);
+static int handle_getresuid_exit_end(Tracee *tracee, Config *config, Sysnum sysnum) {
+	POKE_MEM_ID(sysnum, SYSARG_1, ruid);
+	POKE_MEM_ID(sysnum, SYSARG_2, euid);
+	POKE_MEM_ID(sysnum, SYSARG_3, suid);
 	return 0;
 }
 
-static int handle_getresgid_exit_end(Tracee *tracee, Config *config) {
-	POKE_MEM_ID(SYSARG_1, rgid);
-	POKE_MEM_ID(SYSARG_2, egid);
-	POKE_MEM_ID(SYSARG_3, sgid);
+static int handle_getresgid_exit_end(Tracee *tracee, Config *config, Sysnum sysnum) {
+	POKE_MEM_ID(sysnum, SYSARG_1, rgid);
+	POKE_MEM_ID(sysnum, SYSARG_2, egid);
+	POKE_MEM_ID(sysnum, SYSARG_3, sgid);
 	return 0;
 }
 
@@ -593,6 +670,8 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 		return handle_unlink_enter_end(tracee, IGNORE_SYSARG, SYSARG_1, config);
 
 	/* handle_rename(tracee, oldfd_sysarg, oldpath_sysarg, newfd_sysarg, newpath_sysarg, config) */
+	/* int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) */
+	case PR_renameat2:
 	/* int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) */
 	case PR_renameat:
 		return handle_rename_enter_end(tracee, SYSARG_1, SYSARG_2, SYSARG_3, SYSARG_4, config);
@@ -608,10 +687,33 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 	case PR_fchmod: 
 		return handle_chmod_enter_end(tracee, IGNORE_SYSARG, SYSARG_2, 
 			SYSARG_1, IGNORE_SYSARG, config);
+	/* int fchmodat2(int dirfd, const char *pathname, mode_t mode, int flags) */
+	case PR_fchmodat2: {
+		char path[2];
+
+		/* With AT_EMPTY_PATH, an empty path makes fchmodat2 act on
+		 * dirfd itself, as fchmod does.  */
+		if ((peek_reg(tracee, ORIGINAL, SYSARG_4) & AT_EMPTY_PATH) != 0
+		    && read_string(tracee, path, peek_reg(tracee, CURRENT, SYSARG_2), sizeof(path)) > 0
+		    && path[0] == '\0')
+			return handle_chmod_enter_end(tracee, IGNORE_SYSARG, SYSARG_3,
+				SYSARG_1, IGNORE_SYSARG, config);
+	}
+		/* Fall through.  */
 	/* int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags (unused)) */
 	case PR_fchmodat:
 		return handle_chmod_enter_end(tracee, SYSARG_2, SYSARG_3, 
 			IGNORE_SYSARG, SYSARG_1, config);
+
+	/* handle_acl(tracee, path_sysarg, fd_sysarg, config) */
+	/* int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) */
+	/* int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) */
+	case PR_setxattr:
+	case PR_lsetxattr:
+		return handle_acl_enter_end(tracee, SYSARG_1, IGNORE_SYSARG, config);
+	/* int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) */
+	case PR_fsetxattr:
+		return handle_acl_enter_end(tracee, IGNORE_SYSARG, SYSARG_1, config);
 
 	/* handle_chown(tracee, path_sysarg, owner_sysarg, group_sysarg, fd_sysarg, dirfd_sysarg, config) */
 	/* int chown(const char *pathname, uid_t owner, gid_t group) */
@@ -713,6 +815,96 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 		return handle_chown_enter_end(tracee, config, uid_sysarg, gid_sysarg);
 #endif
 
+#ifndef USERLAND
+	case PR_openat: {
+		char path[PATH_MAX];
+		char prefix[64];
+		char *end;
+		int fd_num;
+
+		/* Only apply when the tracee has fake root (DAC override). */
+		if (config->euid != 0)
+			return 0;
+
+		/* Read the translated (host) path from the CURRENT registers.
+		 * helper_functions.h is USERLAND-only so use read_string directly. */
+		if (read_string(tracee, path,
+				peek_reg(tracee, CURRENT, SYSARG_2),
+				PATH_MAX) < 0)
+			return 0;
+
+		/* Check if the path is /proc/<tracee->pid>/fd/<N>.  This
+		 * arises when the guest opens /dev/stderr, /dev/stdout, or
+		 * /proc/self/fd/N — e.g. when a log file is a symlink to
+		 * /dev/stderr (common in containerised nginx/apache images).
+		 * The kernel rejects opening these paths when the underlying
+		 * fd target (e.g. a pty owned by root) isn't accessible to
+		 * the real non-root uid.  Using dup(N) sidesteps that check
+		 * because the fd is already open. */
+		snprintf(prefix, sizeof(prefix), "/proc/%d/fd/", tracee->pid);
+		if (strncmp(path, prefix, strlen(prefix)) != 0)
+			return 0;
+
+		errno = 0;
+		fd_num = (int) strtol(path + strlen(prefix), &end, 10);
+		if (errno != 0 || end == path + strlen(prefix) || *end != '\0' || fd_num < 0)
+			return 0;
+
+		/* If the existing fd was opened with O_PATH, dup() inherits
+		 * that flag and lseek/read/write on the duplicate return
+		 * EBADF.  This breaks the safe_open() pattern used by e.g.
+		 * systemd-machine-id-setup, which opens a file with O_PATH
+		 * first and then reopens it via /proc/self/fd/N with real
+		 * access flags.  Skip the substitution in that case — the
+		 * kernel reopens the underlying file with the requested
+		 * flags, and override_permissions() ran during the original
+		 * O_PATH open so the file is still accessible to the real
+		 * uid. */
+		{
+			char fdinfo_path[64];
+			char line[64];
+			unsigned int existing_flags = 0;
+			int have_flags = 0;
+			int requested_flags = (int) peek_reg(tracee, CURRENT, SYSARG_3);
+			struct stat target;
+			FILE *fdinfo;
+
+			snprintf(fdinfo_path, sizeof(fdinfo_path),
+				 "/proc/%d/fdinfo/%d", tracee->pid, fd_num);
+			fdinfo = fopen(fdinfo_path, "r");
+			if (fdinfo != NULL) {
+				while (fgets(line, sizeof(line), fdinfo) != NULL) {
+					if (sscanf(line, "flags: %o", &existing_flags) == 1) {
+						have_flags = 1;
+						break;
+					}
+				}
+				fclose(fdinfo);
+			}
+			if (existing_flags & O_PATH)
+				return 0;
+
+			/* dup() shares the open file description, so it keeps the
+			 * existing access mode instead of the requested one.
+			 * Reopening a regular file or memfd with a different mode
+			 * is how programs derive a reduced-access handle (e.g. a
+			 * read-only memfd to hand to another process); a writable
+			 * dup there silently breaks that guarantee.  Let the
+			 * kernel do the real reopen for those; keep the dup for
+			 * ttys/pipes/sockets, which is what this was added for. */
+			if (have_flags
+			    && (existing_flags & O_ACCMODE) != (unsigned int) (requested_flags & O_ACCMODE)
+			    && stat(path, &target) == 0
+			    && S_ISREG(target.st_mode))
+				return 0;
+		}
+
+		set_sysnum(tracee, PR_dup);
+		poke_reg(tracee, SYSARG_1, (word_t) fd_num);
+		return 0;
+	}
+#endif /* ifndef USERLAND */
+
 	case PR_setgroups:
 	case PR_setgroups32:
 	case PR_getgroups:
@@ -800,14 +992,16 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		if ((int)result <= 0)
 			return result;
+		if (result >= PATH_MAX)
+			return -ENAMETOOLONG;
 
-		status = read_sysarg_path(tracee, path, SYSARG_3, MODIFIED);
-		if(status < 0) 
+		status = read_data(tracee, path, peek_reg(tracee, MODIFIED, SYSARG_3), result);
+		if (status < 0)
 			return status;
 
 		path[result] = '\0';
 
-		if ((strcmp(path + strlen(path) - strlen(" (deleted)"), " (deleted)") == 0) || (strncmp(path, "pipe", 4) == 0)) {
+		if ((path[0] != '/') || (result >= strlen(" (deleted)") && strcmp(path + result - strlen(" (deleted)"), " (deleted)") == 0)) {
 			register_chained_syscall(tracee, sysnum, peek_reg(tracee, ORIGINAL, SYSARG_1), peek_reg(tracee, ORIGINAL, SYSARG_2), 0, 0, 0, 0);
 		} else {
 			write_data(tracee, peek_reg(tracee, MODIFIED, SYSARG_3), path, sizeof(path));
@@ -856,6 +1050,21 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_setfsgid32:
 		SETFSXID(g);
 
+	case PR_prctl: {
+		/* Mirror the tracee's PR_SET_KEEPCAPS state.  The real prctl
+		 * runs on the kernel; we only observe successful calls so the
+		 * fake_id0 cap model stays in sync with what the kernel does
+		 * for the tracee (PR_GET_KEEPCAPS is satisfied by the kernel
+		 * directly and needs no intercept). */
+		int op = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+		int result = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+		if (result == 0 && op == PR_SET_KEEPCAPS) {
+			word_t arg = peek_reg(tracee, ORIGINAL, SYSARG_2);
+			config->keep_caps = (arg != 0);
+		}
+		return 0;
+	}
+
 	case PR_getuid:
 	case PR_getuid32:
 		poke_reg(tracee, SYSARG_RESULT, config->ruid);
@@ -878,11 +1087,11 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 
 	case PR_getresuid:
 	case PR_getresuid32:
-		return handle_getresuid_exit_end(tracee, config);
+		return handle_getresuid_exit_end(tracee, config, sysnum);
 
 	case PR_getresgid:
 	case PR_getresgid32:
-		return handle_getresgid_exit_end(tracee, config);
+		return handle_getresgid_exit_end(tracee, config, sysnum);
 
 #ifdef USERLAND
 	case PR_umask:
@@ -908,21 +1117,44 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_mknod:
 	case PR_mknodat:
 	case PR_capset:
+#ifndef USERLAND
 	case PR_chmod:
+#endif
 	case PR_chown:
+#ifndef USERLAND
 	case PR_fchmod:
+#endif
 	case PR_fchown:
 	case PR_lchown:
 	case PR_chown32:
 	case PR_fchown32:
 	case PR_lchown32:
+#ifndef USERLAND
 	case PR_fchmodat:
+	case PR_fchmodat2:
+#endif
 	case PR_fchownat: 
 		return handle_perm_err_exit_end(tracee, config, false);
+
+#ifdef USERLAND
+	case PR_chmod:
+	case PR_fchmod:
+	case PR_fchmodat:
+	case PR_fchmodat2:
+		/* Record the new mode once a permission error may have
+		 * been turned into a success.  */
+		(void) handle_perm_err_exit_end(tracee, config, false);
+		return handle_chmod_exit_end(tracee, config);
+#endif
 
 	case PR_setxattr:
 	case PR_lsetxattr:
 	case PR_fsetxattr:
+#ifdef USERLAND
+		/* Before a permission error is turned into a success: the
+		 * ACL, if any, didn't change the mode then.  */
+		(void) handle_acl_exit_end(tracee, config);
+#endif
 		return handle_perm_err_exit_end(tracee, config, true);
 
 	case PR_socket: 
@@ -960,6 +1192,14 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 		return handle_getsockopt_exit_end(tracee);
 
 #ifdef USERLAND
+	/* handle_rename_exit_end(tracee, oldpath_sysarg, newpath_sysarg, flags_sysarg, config) */
+	case PR_renameat2:
+		return handle_rename_exit_end(tracee, SYSARG_2, SYSARG_4, SYSARG_5, config);
+	case PR_renameat:
+		return handle_rename_exit_end(tracee, SYSARG_2, SYSARG_4, IGNORE_SYSARG, config);
+	case PR_rename:
+		return handle_rename_exit_end(tracee, SYSARG_1, SYSARG_2, IGNORE_SYSARG, config);
+
 /** Check to see if a meta was created for a file that no longer exists.
  *  If so, delete it.
  */
@@ -1056,6 +1296,9 @@ static int handle_sysexit_start(Tracee *tracee, Config *config) {
 	if (!tracee->skip_proot_loader)
 		adjust_elf_auxv(tracee, config);
 
+	/* Linux clears PR_SET_KEEPCAPS on execve. */
+	config->keep_caps = false;
+
 	status = stat(tracee->host_exe, &mode);
 	if (status < 0)
 		return 0; /* Not fatal.  */
@@ -1063,6 +1306,8 @@ static int handle_sysexit_start(Tracee *tracee, Config *config) {
 	if ((mode.st_mode & S_ISUID) != 0) {
 		config->euid = 0;
 		config->suid = 0;
+		/* Setuid-root binary gives the process fake CAP_SETUID. */
+		config->caps_active = true;
 	}
 
 	if ((mode.st_mode & S_ISGID) != 0) {
@@ -1116,8 +1361,13 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 		config->egid  = gid;
 		config->sgid  = gid;
 		config->fsgid = gid;
+		config->caps_active = (uid == 0);
+		config->keep_caps = false;
 			/* Set the umask to the typical linux value. */
 			config->umask = 022;
+#ifdef USERLAND
+		config->pending_path = NULL;
+#endif
 
 		extension->filtered_sysnums = filtered_sysnums;
 		return 0;
@@ -1145,6 +1395,10 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 			return -1;
 
 		memcpy(extension->config, parent->config, sizeof(Config));
+#ifdef USERLAND
+		/* This one belongs to the parent's current syscall.  */
+		((Config *) extension->config)->pending_path = NULL;
+#endif
 		return 0;
 	}
 

@@ -22,6 +22,8 @@
 
 #include <sched.h>      /* CLONE_*,  */
 #include <sys/types.h>  /* pid_t, size_t, */
+#include <stdio.h>      /* fopen(3), fgets(3), sscanf(3), */
+#include <unistd.h>     /* getpid(2), */
 #include <stdlib.h>     /* NULL, */
 #include <assert.h>     /* assert(3), */
 #include <string.h>     /* bzero(3), */
@@ -30,6 +32,7 @@
 #include <talloc.h>     /* talloc_*, */
 #include <signal.h>     /* kill(2), SIGKILL, */
 #include <sys/ptrace.h> /* ptrace(2), PTRACE_*, */
+#include <sys/wait.h>   /* waitid(2), */
 #include <errno.h>      /* E*, */
 #include <inttypes.h>   /* PRI*, */
 
@@ -194,6 +197,7 @@ Tracee *new_dummy_tracee(TALLOC_CTX *context)
 	 * name-space and heap.  */
 	tracee->fs = talloc_zero(tracee, FileSystemNameSpace);
 	tracee->heap = talloc_zero(tracee, Heap);
+	tracee->auxv_fd = -1;
 	if (tracee->fs == NULL || tracee->heap == NULL)
 		goto no_mem;
 
@@ -375,15 +379,289 @@ void free_terminated_tracees()
 }
 
 /**
+ * Return the tracee which did the execve(2) reported by the
+ * PTRACE_EVENT_EXEC stop of @leader.  When a thread other than the
+ * leader of its process calls execve(2), the kernel kills all the
+ * other threads, then it releases the leader without reporting its
+ * death and gives its PID to the calling thread, whose own TID
+ * disappears just as silently:
+ *
+ *     In this stop, the tracer can use PTRACE_GETEVENTMSG to
+ *     retrieve the tracee's former thread ID.
+ *     [...]
+ *     On receiving the PTRACE_EVENT_EXEC stop notification, the
+ *     tracer should clean up all its internal data structures
+ *     describing the threads of this process, and retain only one
+ *     data structure
+ *
+ *     -- ptrace(2) man-page
+ *
+ * The one to retain is the entry of the thread, it carries the
+ * state of that execve(2), whose exit stage is still to come.  Left
+ * as is, this exit stage would be handled with the entry of the
+ * leader, and the one of the thread would never be freed, until
+ * attach_child() runs into it once the kernel reuses its TID.
+ *
+ * Note: this is meant to be called by the event loop only, right
+ * after waitpid(2), where nothing refers to the entry it frees.
+ */
+Tracee *get_execve_tracee(Tracee *leader)
+{
+	unsigned long former_pid = 0;
+	Tracee *relative;
+	Tracee *thread;
+	int status;
+
+	status = ptrace(PTRACE_GETEVENTMSG, leader->pid, NULL, &former_pid);
+	if (status < 0 || former_pid == 0 || (pid_t) former_pid == leader->pid)
+		return leader;
+
+	thread = get_tracee(leader, (pid_t) former_pid, false);
+	if (thread == NULL)
+		return leader;
+
+	VERBOSE(thread, 1, "vpid %" PRIu64 ": execve(2) from thread %d of pid %d",
+		thread->vpid, thread->pid, leader->pid);
+
+	/* From now on, the thread is the process the leader was.  */
+	LIST_FOREACH(relative, &tracees, link) {
+		if (relative->parent == leader)
+			relative->parent = thread;
+	}
+
+	thread->pid    = leader->pid;
+	thread->vpid   = leader->vpid;
+	thread->parent = leader->parent;
+	thread->clone  = leader->clone;
+	thread->killall_on_exit = leader->killall_on_exit;
+
+	/* Not terminate_tracee(): the process isn't over.  */
+	TALLOC_FREE(leader);
+
+	return thread;
+}
+
+/**
+ * Tell whether PRoot is still the tracer of its new child @pid.  A
+ * child can be killed before PRoot gets the event of the fork-like
+ * syscall which created it, then its death can be reported first.
+ * PRoot isn't its tracer anymore once that's done.
+ */
+static bool is_still_traced(pid_t pid)
+{
+	siginfo_t info;
+	int status;
+
+	status = waitid(P_PID, pid, &info, WEXITED | WSTOPPED | WNOHANG | WNOWAIT | __WALL);
+	return (status == 0 || errno != ECHILD);
+}
+
+static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid);
+
+/**
+ * Read the Tgid, PPid and TracerPid fields of /proc/@pid/status.  This
+ * function returns -1 if they can't all be read, otherwise 0.
+ */
+static int read_proc_status_ids(pid_t pid, pid_t *tgid, pid_t *ppid, pid_t *tracer)
+{
+	char path[64];
+	char line[128];
+	int found = 0;
+	FILE *file;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	file = fopen(path, "r");
+	if (file == NULL)
+		return -1;
+
+	while (found != 7 && fgets(line, sizeof(line), file) != NULL) {
+		if (sscanf(line, "Tgid: %d", tgid) == 1)
+			found |= 1;
+		else if (sscanf(line, "PPid: %d", ppid) == 1)
+			found |= 2;
+		else if (sscanf(line, "TracerPid: %d", tracer) == 1)
+			found |= 4;
+	}
+	fclose(file);
+
+	return (found == 7 ? 0 : -1);
+}
+
+/**
+ * Return the stack pointer the child of the fork-like syscall @parent
+ * is stopped in starts with: the stack the syscall was given, if any,
+ * otherwise the stack of @parent itself.
+ */
+static word_t new_child_stack(Tracee *parent)
+{
+	word_t stack = 0;
+
+	switch (get_sysnum(parent, CURRENT)) {
+	case PR_clone:
+		stack = peek_reg(parent, CURRENT, SYSARG_2);
+		break;
+
+	case PR_clone3: {
+		/* The child starts at the top of the area described
+		 * by the "stack" and "stack_size" fields of struct
+		 * clone_args, the 6th and 7th 64-bit words.  */
+		word_t args = peek_reg(parent, CURRENT, SYSARG_1);
+		word_t size;
+
+		errno = 0;
+		stack = peek_word(parent, args + 5 * 8);
+		size  = peek_word(parent, args + 6 * 8);
+		stack = (errno != 0 || stack == 0 ? 0 : stack + size);
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	return (stack != 0 ? stack : peek_reg(parent, CURRENT, STACK_POINTER));
+}
+
+/**
+ * Tell whether @child, stopped but unknown to PRoot yet, was created
+ * by the fork-like syscall whose event didn't name the child @parent
+ * got (see new_child()).
+ */
+static bool is_pending_child_of(const Tracee *parent, Tracee *child)
+{
+	word_t flags = parent->pending_clone_flags;
+	pid_t child_tgid, child_ppid, parent_tgid, parent_ppid, tracer;
+	bool related;
+
+	if (read_proc_status_ids(child->pid, &child_tgid, &child_ppid, &tracer) < 0
+	    || read_proc_status_ids(parent->pid, &parent_tgid, &parent_ppid, &tracer) < 0)
+		return false;
+
+	/* A new thread joins the thread group of its creator; a new
+	 * process is the child of the process which forked it, unless
+	 * it was given the parent of that process.  */
+	if ((flags & CLONE_THREAD) != 0)
+		related = (child_tgid == parent_tgid);
+	else if ((flags & CLONE_PARENT) != 0)
+		related = (child_ppid == parent_ppid);
+	else
+		related = (child_ppid == parent_tgid);
+
+	if (!related)
+		return false;
+
+	/* That still can't tell apart the threads of a process forking
+	 * at the same time, but their children can: the stack a new
+	 * child starts with, untouched until its first stop, is the one
+	 * its parent asked for, and no two threads share a stack.  */
+#if defined(ARCH_ARM64)
+	child->is_aarch32 = parent->is_aarch32;
+#endif
+	if (fetch_regs(child) < 0)
+		return false;
+
+	return (peek_reg(child, CURRENT, STACK_POINTER) == parent->pending_child_sp);
+}
+
+/**
+ * Register the stopped tracees PRoot doesn't know yet whose parent is
+ * blocked in a vfork-like syscall that was reported without the new
+ * child's PID (see new_child()).  Such a parent reaches the exit of
+ * that syscall only once its child has run, so its child can't wait
+ * for it.  Other parents are handled when their syscall exits, where
+ * its result names the child exactly (see resolve_pending_child()).
+ */
+void adopt_held_children(void)
+{
+	bool vfork_pending = false;
+	Tracee *parent;
+	Tracee *child;
+
+	LIST_FOREACH(parent, &tracees, link) {
+		if (parent->pending_child && (parent->pending_clone_flags & CLONE_VFORK) != 0)
+			vfork_pending = true;
+	}
+
+	if (!vfork_pending)
+		return;
+
+	LIST_FOREACH(child, &tracees, link) {
+		if (child->exe != NULL || child->sigstop != SIGSTOP_PENDING || child->terminated)
+			continue;
+
+		LIST_FOREACH(parent, &tracees, link) {
+			if (!parent->pending_child
+			    || (parent->pending_clone_flags & CLONE_VFORK) == 0
+			    || parent->exe == NULL
+			    || parent->terminated
+			    || !is_pending_child_of(parent, child))
+				continue;
+
+			parent->pending_child = false;
+			(void) attach_child(parent, parent->pending_clone_flags, child->pid);
+			break;
+		}
+	}
+}
+
+/**
+ * Register the child @parent created with a fork-like syscall that was
+ * reported without the new child's PID (see new_child()), now that
+ * @parent is at the exit stage of a syscall.  If that syscall is the
+ * one which forked, its result is the PID in question.
+ */
+void resolve_pending_child(Tracee *parent)
+{
+	pid_t tgid, ppid, tracer;
+	Tracee *child;
+	pid_t pid;
+
+	switch (get_sysnum(parent, ORIGINAL)) {
+	case PR_clone:
+	case PR_clone3:
+	case PR_fork:
+	case PR_vfork:
+		break;
+
+	default:
+		/* The result of any other syscall isn't a PID: never
+		 * mistake it for the child's.  */
+		return;
+	}
+
+	parent->pending_child = false;
+
+	pid = (pid_t) (int) peek_reg(parent, CURRENT, SYSARG_RESULT);
+
+	/* Already registered by adopt_held_children()?  */
+	child = (pid > 0 ? get_tracee(parent, pid, false) : NULL);
+	if (child != NULL && child->exe != NULL)
+		return;
+
+	/* Make sure that PID designates a process PRoot is tracing
+	 * before tracking it (and killing it on exit).  */
+	if (pid <= 0
+	    || read_proc_status_ids(pid, &tgid, &ppid, &tracer) < 0
+	    || tracer != getpid()) {
+		note(parent, WARNING, INTERNAL,
+			"vpid %" PRIu64 ": can't find the child of a fork reported without its pid",
+			parent->vpid);
+		parent->clone_stripped_newns = false;
+		parent->clone_stripped_newnet = false;
+		return;
+	}
+
+	(void) attach_child(parent, parent->pending_clone_flags, pid);
+}
+
+/**
  * Make new @parent's child inherit from it.  Depending on
  * @clone_flags, some information are copied or shared.  This function
  * returns -errno if an error occured, otherwise 0.
  */
 int new_child(Tracee *parent, word_t clone_flags)
 {
-	int ptrace_options;
-	unsigned long pid;
-	Tracee *child;
+	unsigned long pid = 0;
 	int status;
 
 	/* If the tracee calls clone(2) with the CLONE_VFORK flag,
@@ -404,14 +682,68 @@ int new_child(Tracee *parent, word_t clone_flags)
                 // contains the usual clone flags.
                 clone_flags = peek_word(parent, peek_reg(parent, CURRENT, SYSARG_1));
 
-	/* Get the pid of the parent's new child.  */
+	/* A fork-like syscall that PRoot restarted in place of one the
+	 * outer seccomp policy rejected (see
+	 * restart_syscall_after_seccomp()) can only be the clone(2) it
+	 * runs for fork(2).  */
+	parent->fork_rewritten_after_seccomp = parent->restore_original_regs_after_seccomp_event;
+
+	/* Get the pid of the parent's new child.  Some kernels (seen
+	 * on aarch64 4.14.357 builds) clear the message of the last
+	 * ptrace event on every ptrace request, so the PID reads as 0,
+	 * although the fork succeeded and the child is already waiting
+	 * for PRoot, stopped.  Register that child later: from the
+	 * result of the syscall once @parent reaches its exit, or from
+	 * the child's own stop when @parent can't get there before the
+	 * child has run, ie. when blocked in vfork(2).  */
 	status = ptrace(PTRACE_GETEVENTMSG, parent->pid, NULL, &pid);
 	if (status < 0 || pid == 0) {
-		note(parent, WARNING, SYSTEM, "ptrace(GETEVENTMSG)");
-		return status;
+		VERBOSE(parent, 1, "vpid %" PRIu64 ": fork event without the child's pid",
+			parent->vpid);
+		parent->pending_child = true;
+		parent->pending_clone_flags = clone_flags;
+		parent->pending_child_sp = new_child_stack(parent);
+		adopt_held_children();
+		return 0;
 	}
 
-	child = get_tracee(parent, (pid_t) pid, true);
+	return attach_child(parent, clone_flags, (pid_t) pid);
+}
+
+/**
+ * Register @pid as the new child of @parent, see new_child().
+ */
+static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
+{
+	int ptrace_options;
+	Tracee *child;
+
+	child = get_tracee(parent, pid, false);
+
+	/* Nothing was heard from this child yet, but it might be dead
+	 * already, and PRoot done with it (see is_still_traced()).
+	 * An entry created for it would then never be freed.  */
+	if (child == NULL && !is_still_traced(pid)) {
+		VERBOSE(parent, 1, "vpid %" PRIu64 ": child %d is gone already",
+			parent->vpid, pid);
+		parent->fork_rewritten_after_seccomp = false;
+		parent->clone_stripped_newns = false;
+		parent->clone_stripped_newnet = false;
+		return 0;
+	}
+
+	/* The kernel has just given @pid to this new child, so an
+	 * entry already set up for it was left by a former process
+	 * whose end PRoot missed: replace this entry.  */
+	if (child != NULL && child->exe != NULL) {
+		VERBOSE(parent, 1, "vpid %" PRIu64 ": pid %d reused, dropping vpid %" PRIu64,
+			parent->vpid, pid, child->vpid);
+		terminate_tracee(child);
+		child = NULL;
+	}
+
+	if (child == NULL)
+		child = new_tracee(pid);
 	if (child == NULL) {
 		note(parent, WARNING, SYSTEM, "running out of memory");
 		return -ENOMEM;
@@ -432,12 +764,28 @@ int new_child(Tracee *parent, word_t clone_flags)
 	child->verbose = parent->verbose;
 	child->seccomp = parent->seccomp;
 	child->sysexit_pending = parent->sysexit_pending;
+	child->execfn_addr = parent->execfn_addr;
+	child->auxv_fd = parent->auxv_fd;
+	child->no_new_privs = parent->no_new_privs;
+	child->seen_execve = parent->seen_execve;
 #ifdef HAS_POKEDATA_WORKAROUND
 	child->pokedata_workaround_stub_addr = parent->pokedata_workaround_stub_addr;
 #endif
 #ifdef ARCH_ARM64
 	child->is_aarch32 = parent->is_aarch32;
 #endif
+
+	/* The child starts with a copy of the registers its parent
+	 * had when entering the syscall, ie. with the arguments PRoot
+	 * put there to run fork(2) as clone(2).  The kernel would have
+	 * preserved the original ones, so give them back to the child
+	 * at its first stop, as they are to the parent at the exit
+	 * stage.  */
+	if (parent->fork_rewritten_after_seccomp) {
+		parent->fork_rewritten_after_seccomp = false;
+		child->_regs[ORIGINAL_SECCOMP_REWRITE] = parent->_regs[ORIGINAL_SECCOMP_REWRITE];
+		child->restore_regs_at_first_stop = true;
+	}
 
 	/* If CLONE_VM is set, the calling process and the child
 	 * process run in the same memory space [...] any memory
@@ -537,13 +885,68 @@ int new_child(Tracee *parent, word_t clone_flags)
 			return -ENOMEM;
 		talloc_set_name_const(child->fs->cwd, "$cwd");
 
-		/* Bindings are shared across file-system name-spaces since a
-		 * "mount --bind" made by a process affects all other processes
-		 * under Linux.  Actually they are copied when a sub
-		 * reconfiguration occured (nested proot or chroot(2)).  */
-		child->fs->bindings.guest = talloc_reference(child->fs, parent->fs->bindings.guest);
-		child->fs->bindings.host  = talloc_reference(child->fs, parent->fs->bindings.host);
+		if (parent->clone_stripped_newns
+		    && parent->fs->bindings.guest != NULL) {
+			/* Caller asked for CLONE_NEWNS (which we
+			 * silently stripped).  Give the child its own
+			 * copy of the binding tree so emulated mount(2)
+			 * calls don't propagate back to the parent.  */
+			Binding *iter;
+
+			child->fs->bindings.guest = talloc_zero(child->fs, Bindings);
+			child->fs->bindings.host  = talloc_zero(child->fs, Bindings);
+			if (   child->fs->bindings.guest == NULL
+			    || child->fs->bindings.host  == NULL)
+				return -ENOMEM;
+			CIRCLEQ_INIT(child->fs->bindings.guest);
+			CIRCLEQ_INIT(child->fs->bindings.host);
+
+			for (iter = CIRCLEQ_FIRST(parent->fs->bindings.guest);
+			     iter != (void *) parent->fs->bindings.guest;
+			     iter = CIRCLEQ_NEXT(iter, link.guest))
+				(void) insort_binding3(child, child->fs,
+						       iter->host.path,
+						       iter->guest.path);
+		}
+		else {
+			/* Bindings are shared across file-system name-spaces since a
+			 * "mount --bind" made by a process affects all other processes
+			 * under Linux.  Actually they are copied when a sub
+			 * reconfiguration occured (nested proot or chroot(2)).  */
+			child->fs->bindings.guest = talloc_reference(child->fs, parent->fs->bindings.guest);
+			child->fs->bindings.host  = talloc_reference(child->fs, parent->fs->bindings.host);
+		}
 	}
+
+	/* Always consume the stripped-NEWNS flag once a child has been
+	 * processed, regardless of which branch above we took (the flag
+	 * could persist otherwise — e.g. when CLONE_FS sent us straight
+	 * to the shared-fs path, or when bindings.guest wasn't ready
+	 * yet — and incorrectly isolate the bindings of an unrelated
+	 * later clone in the same parent).  */
+	parent->clone_stripped_newns = false;
+
+	/* A child either enters the network namespace its parent asked
+	 * for with this very clone(2), or stays in the one the parent
+	 * already believes it lives in.  Either way it gets rtnetlink
+	 * answers for a namespace of its own (see enter.c).  */
+	child->fake_netns = parent->fake_netns || parent->clone_stripped_newnet;
+	parent->clone_stripped_newnet = false;
+
+	/* Open fds survive fork(2)/clone(2), so the child has to keep
+	 * recognising the netlink sockets its parent opened.  The reply
+	 * pending on either of them doesn't carry over: it belongs to
+	 * whoever sent the request.  */
+	for (int i = 0; i < parent->fake_netlink_fds_count; i++) {
+		child->fake_netlink_fds[i].fd = parent->fake_netlink_fds[i].fd;
+		child->fake_netlink_fds[i].reply = NULL;
+		child->fake_netlink_fds[i].reply_len = 0;
+		child->fake_netlink_fds[i].reply_off = 0;
+	}
+	child->fake_netlink_fds_count = parent->fake_netlink_fds_count;
+	memcpy(child->netlink_route_fds, parent->netlink_route_fds,
+	       sizeof(child->netlink_route_fds));
+	child->netlink_route_fds_count = parent->netlink_route_fds_count;
 
 	/* The path to the executable is unshared only once the child
 	 * process does a call to execve(2).  */
@@ -560,11 +963,16 @@ int new_child(Tracee *parent, word_t clone_flags)
 	inherit_extensions(child, parent, clone_flags);
 
 	/* Restart the child tracee if it was already alive but
-	 * stopped until that moment.  */
-	if (child->sigstop == SIGSTOP_PENDING) {
+	 * stopped until that moment.  It isn't stopped anymore if it
+	 * was killed in the meantime: it was restarted towards its
+	 * death from its PTRACE_EVENT_EXIT stop already.  */
+	if (child->sigstop == SIGSTOP_PENDING && !child->running) {
 		bool keep_stopped = false;
 
 		child->sigstop = SIGSTOP_ALLOWED;
+
+		/* This SIGSTOP was its first stop.  */
+		restore_child_regs_after_seccomp(child);
 
 		/* Notify its ptracer if it is ready to be traced.  */
 		if (child->as_ptracee.ptracer != NULL) {

@@ -28,7 +28,7 @@
 #include <stdlib.h>        /* exit(3), EXIT_*, strtol(3), {g,s}etenv(3), */
 #include <assert.h>        /* assert(3),  */
 #include <sys/types.h>     /* getpid(2),  */
-#include <unistd.h>        /* getpid(2),  */
+#include <unistd.h>        /* getpid(2), _exit(2), */
 #include <errno.h>         /* errno(3), */
 #include <libgen.h>        /* basename(3), */
 #ifdef __GLIBC__
@@ -280,10 +280,6 @@ static int initialize_exe(Tracee *tracee, const char *exe)
 	if (status < 0)
 		return -1;
 
-	status = detranslate_path(tracee, path, NULL);
-	if (status < 0)
-		return -1;
-
 	tracee->exe = talloc_strdup(tracee, path);
 	if (tracee->exe == NULL)
 		return -1;
@@ -448,6 +444,7 @@ bool exit_failure = true;
 int main(int argc, char *const argv[])
 {
 	Tracee *tracee;
+	pid_t pid;
 	int status;
 
 	/* Configure the memory allocator.
@@ -504,10 +501,31 @@ int main(int argc, char *const argv[])
 	if (NULL == getenv("PROOT_NO_MOUNTINFO"))
 		initialize_extension(tracee, mountinfo_callback, NULL);
 
+	/* Initialized last, so it is first in the extension list: its
+	 * HOST_PATH answer must reach fake_id0 before fake_id0 chmods a
+	 * protected path, and its SYSCALL_ENTER_END must refuse a write before
+	 * link2symlink acts on it.  */
+	if (getenv("PROOT_READONLY_PATHS") != NULL
+	    && initialize_extension(tracee, readonly_paths_callback, getenv("PROOT_READONLY_PATHS")) < 0)
+		note(tracee, WARNING, INTERNAL, "readonly-paths not initialized");
+
 	/* Start the first tracee.  */
+	pid = getpid();
 	status = launch_process(tracee, &argv[status]);
 	if (status < 0) {
 		print_execve_help(tracee, tracee->exe, status);
+
+		/* This is the child of launch_process() if it couldn't
+		 * execute the program.  Its syscalls are translated by
+		 * the parent now, so the talloc destructors run on exit
+		 * -- removal of the glue and of the placeholders of the
+		 * bindings -- would act on whatever these paths lead to
+		 * in the guest, the content of a host directory bound
+		 * there for instance.  The parent removes them.  */
+		if (getpid() != pid) {
+			fprintf(stderr, "fatal error: see `%s --help`.\n", basename(argv[0]));
+			_exit(EXIT_FAILURE);
+		}
 		goto error;
 	}
 
